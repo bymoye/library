@@ -1,5 +1,4 @@
 import asyncio
-from functools import cache
 import orjson
 from blacksheep.contents import Content
 from blacksheep.messages import Response
@@ -87,8 +86,13 @@ async def get_book(id: int,redis:RedisCon) -> Response:
     '''
     获取指定书籍
     '''
-    data = await redis.redis_conn.keys('book:%s:*'%id)
-    if len(data) != 0:
+    # 从redis中搜索匹配
+    cur,data = await redis.redis_conn.scan(match='book:%s:*'%id,count=1000)
+    # 当游标(cur)为0时表示搜索完毕 否则继续搜索
+    while cur != 0 and data == []:
+        data = await redis.redis_conn.scan(cursor = cur,match='book:%s:*'%id,count=1000)
+    # 当搜索完毕数据不为空时
+    if data != []:
         data = orjson.loads(await redis.get(data[0]))
         return data_res(200,data)
     else:
@@ -100,37 +104,79 @@ async def add_books(item : BookPydanticIn,redis:RedisCon) -> Response:
     '''
     添加书籍
     '''
-    check = await redis.redis_conn.keys('book:*:%s'% item.isbn)
-    if check != []:
+    # 搜索书籍是否存在
+    cur,data = await redis.redis_conn.scan(match='book:*:%s'% item.isbn,count=1000)
+    # 游标为0表示搜索完毕 否则继续搜索
+    while cur != 0 and data == []:
+        cur,data = await redis.redis_conn.scan(cursor = cur,match='book:*:%s'% item.isbn,count=1000)
+    # 如果搜索完毕数据不为空时
+    if data != []:
         return res(400, '该书籍已存在')
     else:
+       # 否则添加书籍
        data = await BooksTable.create(**item.dict(exclude_unset=True))
+       # 将书籍信息放入redis中
        book = dict(i for i in data)
        await redis.set('book:%s:%s'%(book['id'],book['isbn']),orjson.dumps(book))
+       # 清除book:all缓存 以等待下次请求 更新数据
+       await redis.delete('book:all')
     return data_res(201, dict(i for i in book))
 
 # patch /api/books/{id}
 @auth('admin')
-async def update_books(book: BookPydanticIn,id:int) -> Response:
+async def update_books(book: BookPydanticIn,id:int,redis:RedisCon) -> Response:
     '''
     更新书籍
     '''
-    if not await BooksTable.filter(id=id).exists() or await BooksTable.filter(isbn=book.isbn).exclude(id=id).exists():
-        return res(400, '该书籍不存在或ISBN已存在')
-    book = await BooksTable.filter(id=id).update(**book.dict(exclude_unset=True))
-    return data_res(200, await BooksTable.filter(id=id).first().values())
+    # 搜索书籍是否存在
+    idcur,idcheck = await redis.redis_conn.scan(match='book:%s:*'%id,count=1000)
+    # 搜索
+    isbncur,isbncheck = await redis.redis_conn.scan(match='book:*:%s'% book.isbn,count=1000)
+    while idcur != 0 and idcheck == []:
+        idcur,idcheck = await redis.redis_conn.scan(cursor = idcur,match='book:%s:*'%id,count=1000)
+    while isbncur != 0 and isbncheck == []:
+        isbncur,isbncheck = await redis.redis_conn.scan(cursor = isbncur,match='book:*:%s'% book.isbn,count=1000)
+    # 如果搜索完毕数据为空
+    if idcheck == []:
+        return res(400,'该书籍不存在')
+    # 判断该isbn是否已经存在
+    if isbncheck != [] and isbncheck[0].decode().split(':')[1].strip() != str(id):
+        return res(400, '该ISBN已存在')
+    # 生成一个sql
+    booksql = BooksTable.filter(id=id).update(**book.dict(exclude_unset=True)).sql()
+    # 提交到 bookstream 消息队列
+    await redis.redis_conn.xadd('bookstream',{'msg':'bookupdate','sql':booksql})
+    key = idcheck[0].decode()
+    data = orjson.loads(await redis.get(key))
+    # 删除当前缓存
+    await redis.delete(key)
+    # 重新将数据放入缓存
+    await redis.set('book:%s:%s'%(id,book.isbn),orjson.dumps({**data,**book.dict(exclude_unset=True)}))
+    return data_res(200, orjson.loads(await redis.get('book:%s:%s'%(id,book.isbn))))
 
 # delete /api/books/{id}
 @auth('admin')
-async def delete_books(id:int) -> Response:
+async def delete_books(id:int,redis:RedisCon) -> Response:
     '''
     删除书籍
     '''
-    borrow_info = await BorrowTable.filter(borrowId=id,backdate=None).count()
-    if borrow_info != 0:
-        return res(400, '该书籍已被借出，无法删除')
-    else:
-        deletenum = await BooksTable.filter(id=id).delete()
-        return res(204, '数据已不存在' if deletenum == 0 else '删除成功')
-    
-
+    # 搜索该书籍是否已经被借出
+    cur,borrow = await redis.redis_conn.scan(match='borrow:*:%s:*:false'%id,count=1000)
+    while cur != 0 and borrow == []:
+        borrow = await redis.redis_conn.scan(cursor=cur,match='borrow:*:%s:*:false'%id,count=1000)
+    # 如果该书籍已经被借出
+    if borrow != []:
+        return res(400,'该书籍已被借出，无法删除')
+    # 否则查找相应的书籍
+    cur,book = await redis.redis_conn.scan(match='book:%s:*'%id,count=1000)
+    while cur != 0 and book == []:
+        cur,book = await redis.redis_conn.scan(cursor=cur,match='book:%s:*'%id,count=1000)
+    # 
+    if book == []:
+        return res(400,'该书籍不存在')
+    # 提交到消息队列
+    await redis.redis_conn.xadd('bookstream',{'msg':'bookdelete','sql':BooksTable.filter(id=id).delete().sql()})
+    # 删除缓存
+    await redis.delete('book:all')
+    await redis.delete(book[0].decode())
+    return res(200,'删除成功')

@@ -18,8 +18,7 @@ from models import *
 app = Application()
 register_tortoise(
     app,
-    # db_url="postgres://postgres:6306220a@42.193.254.118:5432/test",
-    db_url="postgres://postgres:6306220a@42.193.254.118:5432/test",
+    db_url="postgres://postgres:postgres@localhost:5432/test",
     modules={"models": ["models"]},
     generate_schemas=True,
 )

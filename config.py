@@ -25,7 +25,7 @@ class Gconfig:
                 self.__dict__.update(config)
     
         except FileNotFoundError as e:
-            print('Error：',e.__str__())
+            print('Error:',e.__str__())
             print('创建config.yaml')
             with open('config.yaml','w') as f:
                 self.__dict__['password'] = input('请键入password(加密用): ')
@@ -33,7 +33,7 @@ class Gconfig:
                 f.write(yaml.safe_dump(self.__dict__))
                 print('文件写入成功,请勿泄露妥善保管,请勿修改config.yaml,否则会造成严重后果.')
         except KeyError as e:
-            print('Error：',e.__str__())
+            print('Error:',e.__str__())
             self.fixConfig()
     
     def fixConfig(self) -> None:
